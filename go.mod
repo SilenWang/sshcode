@@ -1,4 +1,4 @@
-module go.coder.com/sshcode
+module github.com/merith-tk/sshcode
 
 go 1.12
 
