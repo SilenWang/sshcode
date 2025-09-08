@@ -43,6 +43,7 @@ type rootCmd struct {
 	bindAddr          string
 	sshFlags          string
 	uploadCodeServer  string
+	backend           string
 }
 
 func (c *rootCmd) Spec() cli.CommandSpec {
@@ -61,6 +62,7 @@ func (c *rootCmd) RegisterFlags(fl *pflag.FlagSet) {
 	fl.StringVar(&c.bindAddr, "bind", "", "local bind address for SSH tunnel, in [HOST][:PORT] syntax (default: 127.0.0.1)")
 	fl.StringVar(&c.sshFlags, "ssh-flags", "", "custom SSH flags")
 	fl.StringVar(&c.uploadCodeServer, "upload-code-server", "", "custom code-server binary to upload to the remote host")
+	fl.StringVar(&c.backend, "backend", "code-server", "VS Code Web-like backend to use (code-server only for now)")
 }
 
 func (c *rootCmd) Run(fl *pflag.FlagSet) {
@@ -86,6 +88,10 @@ func (c *rootCmd) Run(fl *pflag.FlagSet) {
 		dir = gitbashWindowsDir(dir)
 	}
 
+	if c.backend != "code-server" {
+		flog.Fatal("only 'code-server' backend is supported at this time")
+	}
+
 	err := sshCode(host, dir, options{
 		skipSync:         c.skipSync,
 		sshFlags:         c.sshFlags,
@@ -93,6 +99,7 @@ func (c *rootCmd) Run(fl *pflag.FlagSet) {
 		syncBack:         c.syncBack,
 		reuseConnection:  !c.noReuseConnection,
 		uploadCodeServer: c.uploadCodeServer,
+		backend:          c.backend,
 	})
 
 	if err != nil {

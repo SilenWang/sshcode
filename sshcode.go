@@ -24,6 +24,90 @@ import (
 
 const codeServerDir = "~/.sshcode-server"
 
+// Backend defines the interface for different VS Code Web-like backends.
+type Backend interface {
+	// EnsureInstalled ensures the backend is installed on the remote host.
+	EnsureInstalled(sshFlags, host string, uploadBinary string) error
+	// StartCommand returns the command to start the backend.
+	StartCommand(remotePort, dir string) string
+	// DefaultDir returns the default installation directory for the backend.
+	DefaultDir() string
+}
+
+// codeServerBackend implements the Backend interface for code-server.
+type codeServerBackend struct{}
+
+func (b *codeServerBackend) EnsureInstalled(sshFlags, host string, uploadBinary string) error {
+	if uploadBinary != "" {
+		flog.Info("uploading local code-server binary...")
+		err := copyCodeServerBinary(sshFlags, host, uploadBinary, codeServerDir)
+		if err != nil {
+			return xerrors.Errorf("failed to upload local code-server binary to remote server: %w", err)
+		}
+
+		sshCmdStr :=
+			fmt.Sprintf("ssh %v %v 'chmod +x %v'",
+				sshFlags, host, codeServerDir,
+			)
+
+		sshCmd := exec.Command("sh", "-l", "-c", sshCmdStr)
+		sshCmd.Stdout = os.Stdout
+		sshCmd.Stderr = os.Stderr
+		err = sshCmd.Run()
+		if err != nil {
+			return xerrors.Errorf("failed to make code-server binary executable:\n---ssh cmd---\n%s: %w",
+				sshCmdStr,
+				err,
+			)
+		}
+	} else {
+		flog.Info("ensuring code-server is updated...")
+		dlScript, err := downloadScript(codeServerDir)
+		if err != nil {
+			return xerrors.New("failed to download latest code-server")
+		}
+
+		// Downloads the latest code-server and allows it to be executed.
+		sshCmdStr := fmt.Sprintf("ssh %v %v '/usr/bin/env bash -l'", sshFlags, host)
+		sshCmd := exec.Command("sh", "-l", "-c", sshCmdStr)
+		sshCmd.Stdout = os.Stdout
+		sshCmd.Stderr = os.Stderr
+		sshCmd.Stdin = strings.NewReader(dlScript)
+		err = sshCmd.Run()
+		if err != nil {
+			return xerrors.Errorf("failed to update code-server:\n---ssh cmd---\n%s"+
+				"\n---download script---\n%s: %w",
+				sshCmdStr,
+				dlScript,
+				err,
+			)
+		}
+	}
+	return nil
+}
+
+func (b *codeServerBackend) StartCommand(remotePort, dir string) string {
+	codeServerFlags := []string{
+		fmt.Sprintf("--bind-addr 127.0.0.1:%v", remotePort),
+		"--auth none",
+	}
+	return fmt.Sprintf("%v/code-server %v %v", codeServerDir, dir, strings.Join(codeServerFlags, " "))
+}
+
+func (b *codeServerBackend) DefaultDir() string {
+	return codeServerDir
+}
+
+// getBackend returns the appropriate backend based on the name.
+func getBackend(name string) (Backend, error) {
+	switch name {
+	case "code-server":
+		return &codeServerBackend{}, nil
+	default:
+		return nil, xerrors.Errorf("unknown backend: %s", name)
+	}
+}
+
 const (
 	sshDirectory               = "~/.ssh"
 	sshDirectoryUnsafeModeMask = 0022
@@ -39,6 +123,7 @@ type options struct {
 	remotePort       string
 	sshFlags         string
 	uploadCodeServer string
+	backend          string
 }
 
 func sshCode(host, dir string, o options) error {
@@ -79,51 +164,15 @@ func sshCode(host, dir string, o options) error {
 		}
 	}
 
-	// Upload local code-server or download code-server from CI server.
-	if o.uploadCodeServer != "" {
-		flog.Info("uploading local code-server binary...")
-		err = copyCodeServerBinary(o.sshFlags, host, o.uploadCodeServer, codeServerDir)
-		if err != nil {
-			return xerrors.Errorf("failed to upload local code-server binary to remote server: %w", err)
-		}
+	backend, err := getBackend(o.backend)
+	if err != nil {
+		return xerrors.Errorf("failed to get backend: %w", err)
+	}
 
-		sshCmdStr :=
-			fmt.Sprintf("ssh %v %v 'chmod +x %v'",
-				o.sshFlags, host, codeServerDir,
-			)
-
-		sshCmd := exec.Command("sh", "-l", "-c", sshCmdStr)
-		sshCmd.Stdout = os.Stdout
-		sshCmd.Stderr = os.Stderr
-		err = sshCmd.Run()
-		if err != nil {
-			return xerrors.Errorf("failed to make code-server binary executable:\n---ssh cmd---\n%s: %w",
-				sshCmdStr,
-				err,
-			)
-		}
-	} else {
-		flog.Info("ensuring code-server is updated...")
-		dlScript, err := downloadScript(codeServerDir)
-		if err != nil {
-			return xerrors.New("failed to download latest code-server")
-		}
-
-		// Downloads the latest code-server and allows it to be executed.
-		sshCmdStr := fmt.Sprintf("ssh %v %v '/usr/bin/env bash -l'", o.sshFlags, host)
-		sshCmd := exec.Command("sh", "-l", "-c", sshCmdStr)
-		sshCmd.Stdout = os.Stdout
-		sshCmd.Stderr = os.Stderr
-		sshCmd.Stdin = strings.NewReader(dlScript)
-		err = sshCmd.Run()
-		if err != nil {
-			return xerrors.Errorf("failed to update code-server:\n---ssh cmd---\n%s"+
-				"\n---download script---\n%s: %w",
-				sshCmdStr,
-				dlScript,
-				err,
-			)
-		}
+	// Ensure the backend is installed on the remote host.
+	err = backend.EnsureInstalled(o.sshFlags, host, o.uploadCodeServer)
+	if err != nil {
+		return xerrors.Errorf("failed to ensure backend is installed: %w", err)
 	}
 
 	if !o.skipSync {
@@ -144,11 +193,7 @@ func sshCode(host, dir string, o options) error {
 		flog.Info("synced extensions in %s", time.Since(start))
 	}
 
-	codeServerFlags := []string{
-		fmt.Sprintf("--bind-addr 127.0.0.1:%v", o.remotePort),
-		"--auth none",
-	}
-	codeServerCmdStr := fmt.Sprintf("%v/code-server %v %v", codeServerDir, dir, strings.Join(codeServerFlags, " "))
+	startCmd := backend.StartCommand(o.remotePort, dir)
 
 	flog.Info("starting code-server...")
 
@@ -156,7 +201,7 @@ func sshCode(host, dir string, o options) error {
 
 	sshCmdStr :=
 		fmt.Sprintf("ssh -tt -q -L %v:localhost:%v %v %v '%v'",
-			o.bindAddr, o.remotePort, o.sshFlags, host, codeServerCmdStr,
+			o.bindAddr, o.remotePort, o.sshFlags, host, startCmd,
 		)
 	// Starts code-server and forwards the remote port.
 	sshCmd := exec.Command("sh", "-l", "-c", sshCmdStr)
