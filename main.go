@@ -88,8 +88,8 @@ func (c *rootCmd) Run(fl *pflag.FlagSet) {
 		dir = gitbashWindowsDir(dir)
 	}
 
-	if c.backend != "code-server" {
-		flog.Fatal("only 'code-server' backend is supported at this time")
+	if c.backend != "code-server" && c.backend != "theia" && c.backend != "openvscode-server" {
+		flog.Fatal("supported backends are: 'code-server', 'theia', 'openvscode-server'")
 	}
 
 	err := sshCode(host, dir, options{
@@ -112,7 +112,7 @@ func (c *rootCmd) usage() string {
 }
 
 func (c *rootCmd) description() string {
-	return fmt.Sprintf(`Start VS Code via code-server over SSH.
+	return fmt.Sprintf(`Start VS Code Web-like editors over SSH. Supported backends: code-server, theia, openvscode-server.
 
 Environment variables:
 %v%v use special VS Code settings dir.

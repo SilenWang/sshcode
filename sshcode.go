@@ -98,11 +98,66 @@ func (b *codeServerBackend) DefaultDir() string {
 	return codeServerDir
 }
 
+// theiaBackend implements the Backend interface for Theia.
+type theiaBackend struct{}
+
+func (b *theiaBackend) EnsureInstalled(sshFlags, host string, uploadBinary string) error {
+	// Theia typically needs to be built or installed via npm
+	// For simplicity, we'll assume it's pre-installed on the remote host
+	flog.Info("assuming Theia is already installed on the remote host")
+	return nil
+}
+
+func (b *theiaBackend) StartCommand(remotePort, dir string) string {
+	return fmt.Sprintf("theia start %v --hostname=127.0.0.1 --port=%v", dir, remotePort)
+}
+
+func (b *theiaBackend) DefaultDir() string {
+	return "~"
+}
+
+// openVSCodeServerBackend implements the Backend interface for OpenVSCode Server.
+type openVSCodeServerBackend struct{}
+
+func (b *openVSCodeServerBackend) EnsureInstalled(sshFlags, host string, uploadBinary string) error {
+	// OpenVSCode Server can be installed via a script
+	flog.Info("ensuring OpenVSCode Server is installed...")
+	installScript := `set -euxo pipefail || exit 1
+# Install OpenVSCode Server
+curl -fsSL https://github.com/gitpod-io/openvscode-server/releases/latest/download/openvscode-server-linux-x64.tar.gz | tar -xzf -
+# Create a symlink for easy access
+ln -sf ./openvscode-server-*/bin/openvscode-server openvscode-server
+`
+	
+	sshCmdStr := fmt.Sprintf("ssh %v %v '/usr/bin/env bash -l'", sshFlags, host)
+	sshCmd := exec.Command("sh", "-l", "-c", sshCmdStr)
+	sshCmd.Stdout = os.Stdout
+	sshCmd.Stderr = os.Stderr
+	sshCmd.Stdin = strings.NewReader(installScript)
+	err := sshCmd.Run()
+	if err != nil {
+		return xerrors.Errorf("failed to install OpenVSCode Server: %w", err)
+	}
+	return nil
+}
+
+func (b *openVSCodeServerBackend) StartCommand(remotePort, dir string) string {
+	return fmt.Sprintf("./openvscode-server --without-connection-token --host=127.0.0.1 --port=%v %v", remotePort, dir)
+}
+
+func (b *openVSCodeServerBackend) DefaultDir() string {
+	return "~"
+}
+
 // getBackend returns the appropriate backend based on the name.
 func getBackend(name string) (Backend, error) {
 	switch name {
 	case "code-server":
 		return &codeServerBackend{}, nil
+	case "theia":
+		return &theiaBackend{}, nil
+	case "openvscode-server":
+		return &openVSCodeServerBackend{}, nil
 	default:
 		return nil, xerrors.Errorf("unknown backend: %s", name)
 	}
@@ -682,6 +737,29 @@ func parseHost(host string) (parsedHost string, additionalFlags string, err erro
 		instance := strings.TrimPrefix(host, "gcp:")
 		return parseGCPSSHCmd(instance)
 	default:
+		// Check SSH config for host-specific settings
+		hostConfig, err := getSSHConfigHost(host)
+		if err != nil {
+			flog.Error("failed to parse SSH config: %v", err)
+			return host, "", nil
+		}
+		
+		if hostConfig != nil {
+			// Build additional flags from SSH config
+			var flags []string
+			if port, exists := hostConfig["port"]; exists {
+				flags = append(flags, "-p", port)
+			}
+			if identityFile, exists := hostConfig["identityfile"]; exists {
+				flags = append(flags, "-i", identityFile)
+			}
+			if user, exists := hostConfig["user"]; exists {
+				host = user + "@" + host
+			}
+			// Add other relevant SSH options here
+			
+			return host, strings.Join(flags, " "), nil
+		}
 		return host, "", nil
 	}
 }
@@ -708,6 +786,75 @@ func parseGCPSSHCmd(instance string) (ip, sshFlags string, err error) {
 	userIP := toks[len(toks)-1]
 
 	return strings.TrimSpace(userIP), sshFlags, nil
+}
+
+// parseSSHConfig parses the user's SSH config file to extract host information.
+func parseSSHConfig() (map[string]map[string]string, error) {
+	sshDir := expandPath(sshDirectory)
+	configPath := filepath.Join(sshDir, "config")
+	
+	config := make(map[string]map[string]string)
+	currentHost := ""
+	
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return config, nil
+		}
+		return nil, err
+	}
+	
+	lines := strings.Split(string(data), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "#") || line == "" {
+			continue
+		}
+		
+		if strings.HasPrefix(line, "Host ") {
+			currentHost = strings.TrimSpace(strings.TrimPrefix(line, "Host "))
+			config[currentHost] = make(map[string]string)
+			continue
+		}
+		
+		if currentHost != "" {
+			parts := strings.Fields(line)
+			if len(parts) >= 2 {
+				key := strings.ToLower(parts[0])
+				value := strings.Join(parts[1:], " ")
+				config[currentHost][key] = value
+			}
+		}
+	}
+	
+	return config, nil
+}
+
+// getSSHConfigHost retrieves configuration for a specific host from SSH config.
+func getSSHConfigHost(host string) (map[string]string, error) {
+	config, err := parseSSHConfig()
+	if err != nil {
+		return nil, err
+	}
+	
+	// Check for exact match first
+	if hostConfig, exists := config[host]; exists {
+		return hostConfig, nil
+	}
+	
+	// Check for wildcard matches
+	for pattern, hostConfig := range config {
+		if strings.Contains(pattern, "*") {
+			// Simple wildcard matching
+			patternRegex := strings.ReplaceAll(pattern, "*", ".*")
+			matched, _ := filepath.Match(patternRegex, host)
+			if matched {
+				return hostConfig, nil
+			}
+		}
+	}
+	
+	return nil, nil
 }
 
 // gitbashWindowsDir strips a the msys2 install directory from the beginning of
